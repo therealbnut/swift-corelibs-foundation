@@ -35,6 +35,15 @@ public struct NSJSONWritingOptions : OptionSetType {
     - `NSNumber`s are not NaN or infinity
 */
 
+public enum NSJSONValue {
+    case JSONNull
+    case JSONBool(Bool)
+    case JSONString(String)
+    case JSONNumber(Double)
+    case JSONArray([NSJSONValue])
+    case JSONObject([String:NSJSONValue])
+}
+
 public class NSJSONSerialization : NSObject {
     
     /* Determines whether the given object can be converted to JSON.
@@ -95,19 +104,19 @@ public class NSJSONSerialization : NSObject {
     public class func dataWithJSONObject(obj: AnyObject, options opt: NSJSONWritingOptions) throws -> NSData {
         NSUnimplemented()
     }
-    
+
     /* Create a Foundation object from JSON data. Set the NSJSONReadingAllowFragments option if the parser should allow top-level objects that are not an NSArray or NSDictionary. Setting the NSJSONReadingMutableContainers option will make the parser generate mutable NSArrays and NSDictionaries. Setting the NSJSONReadingMutableLeaves option will make the parser generate mutable NSString objects. If an error occurs during the parse, then the error parameter will be set and the result will be nil.
        The data must be in one of the 5 supported encodings listed in the JSON specification: UTF-8, UTF-16LE, UTF-16BE, UTF-32LE, UTF-32BE. The data may or may not have a BOM. The most efficient encoding to use for parsing is UTF-8, so if you have a choice in encoding the data passed to this method, use UTF-8.
      */
     /// - Experiment: Note that the return type of this function is different than on Darwin Foundation (Any instead of AnyObject). This is likely to change once we have a more complete story for bridging in place.
-    public class func JSONObjectWithData(data: NSData, options opt: NSJSONReadingOptions) throws -> Any {
+    public class func JSONObjectWithData(data: NSData, options opt: NSJSONReadingOptions) throws -> NSJSONValue {
         
         guard let string = NSString(data: data, encoding: detectEncoding(data)) else {
             throw NSError(domain: NSCocoaErrorDomain, code: NSCocoaError.PropertyListReadCorruptError.rawValue, userInfo: [
                 "NSDebugDescription" : "Unable to convert data to a string using the detected encoding. The data may be corrupt."
             ])
         }
-        let result = try JSONObjectWithString(string._swiftObject)
+        let result = try NSJSONValue(fromString: string._swiftObject, allowFragments: opt.contains(.AllowFragments))
         return result
     }
     
@@ -125,19 +134,28 @@ public class NSJSONSerialization : NSObject {
 }
 
 //MARK: - Deserialization
-internal extension NSJSONSerialization {
-    
-    static func JSONObjectWithString(string: String) throws -> Any {
+public extension NSJSONValue {
+    public init(fromString string: String, allowFragments: Bool = false) throws {
         let parser = JSONDeserializer.UnicodeParser(viewSkippingBOM: string.unicodeScalars)
-        if let (object, _) = try JSONDeserializer.parseObject(parser) {
-            return object
+        if allowFragments {
+            if let (value, _) = try JSONDeserializer.parseValue(parser) {
+                self = value
+            }
+            throw NSError(domain: NSCocoaErrorDomain, code: NSCocoaError.PropertyListReadCorruptError.rawValue, userInfo: [
+                "NSDebugDescription" : "JSON text was malformed."
+                ])
         }
-        else if let (array, _) = try JSONDeserializer.parseArray(parser) {
-            return array
+        else {
+            if let (root, _) = try JSONDeserializer.parseCollection(parser) {
+                self = root
+            }
+            throw NSError(domain: NSCocoaErrorDomain, code: NSCocoaError.PropertyListReadCorruptError.rawValue, userInfo: [
+                "NSDebugDescription" : "JSON text did not start with array or object and option to allow fragments not set."
+                ])
         }
-        throw NSError(domain: NSCocoaErrorDomain, code: NSCocoaError.PropertyListReadCorruptError.rawValue, userInfo: [
-            "NSDebugDescription" : "JSON text did not start with array or object and option to allow fragments not set."
-        ])
+    }
+    public func write<Target : OutputStreamType>(linePrefix: String = "", lineSuffix: String = "", inout toStream output: Target) throws {
+        return JSONSerializer.write(self, linePrefix: linePrefix, lineSuffix: lineSuffix, toStream: &output)
     }
 }
 
@@ -206,6 +224,87 @@ internal extension NSJSONSerialization {
     }
 }
 
+private struct StructureScalar {
+    static let BeginArray     = UnicodeScalar(0x5B) // [ left square bracket
+    static let EndArray       = UnicodeScalar(0x5D) // ] right square bracket
+    static let BeginObject    = UnicodeScalar(0x7B) // { left curly bracket
+    static let EndObject      = UnicodeScalar(0x7D) // } right curly bracket
+    static let NameSeparator  = UnicodeScalar(0x3A) // : colon
+    static let ValueSeparator = UnicodeScalar(0x2C) // , comma
+}
+
+private enum Either<LeftType,RightType> {
+    case Left(LeftType)
+    case Right(RightType)
+}
+
+//MARK: - JSONSerializer
+private struct JSONSerializer {
+    typealias LiteralConvertible = Either<NSJSONValue,String>
+    typealias LiteralStream = [LiteralConvertible]
+
+    static func writeString(string: String, inout toValueStream stream: LiteralStream) -> String {
+        // FIXME: Escape
+        return "\"\(string)\""
+    }
+
+    static func writeArray(values: [NSJSONValue], linePrefix: String = "", lineSuffix: String = "", inout toValueStream stream: LiteralStream) {
+        stream.reserveCapacity(stream.count + values.count * 2 + 2)
+        stream.append(.Right("["))
+        if let child = values.first {
+            stream.append(.Left(child))
+            for child in values.suffix(values.count - 1) {
+                stream.append(.Right(","))
+                stream.append(.Left(child))
+            }
+        }
+        stream.append(.Right("]"))
+    }
+
+    static func writeObject(keyValues: [String:NSJSONValue], linePrefix: String = "", lineSuffix: String = "", inout toValueStream stream: LiteralStream) {
+        stream.reserveCapacity(stream.count + keyValues.count * 2 + 2)
+        stream.append(.Right("{"))
+        if let (key,child) = keyValues.first {
+            stream.append(.Right(linePrefix))
+            writeString(key, toValueStream: &stream)
+            stream.append(.Right(":"))
+            stream.append(.Left(child))
+            for (key,child) in keyValues.suffix(keyValues.count - 1) {
+                stream.append(.Right(","))
+                stream.append(.Right(lineSuffix))
+                stream.append(.Right(linePrefix))
+                writeString(key, toValueStream: &stream)
+                stream.append(.Right(":"))
+                stream.append(.Left(child))
+            }
+            stream.append(.Right(lineSuffix))
+        }
+        stream.append(.Right("}"))
+    }
+
+    static func write<Target : OutputStreamType>(value: NSJSONValue, linePrefix: String = "", lineSuffix: String = "", inout toStream output: Target) {
+        var literalStream: LiteralStream = [.Left(value)]
+        while let current = literalStream.popLast() {
+            switch current {
+            case .Left(.JSONNull):
+                output.write("null")
+            case let .Left(.JSONBool(bool)):
+                output.write(bool ? "true" : "false")
+            case let .Left(.JSONNumber(number)):
+                output.write(String(number))
+            case let .Left(.JSONString(string)):
+                JSONSerializer.writeString(string, toValueStream: &literalStream)
+            case let .Left(.JSONArray(values)):
+                JSONSerializer.writeArray(values, linePrefix: linePrefix, lineSuffix: lineSuffix, toValueStream: &literalStream)
+            case let .Left(.JSONObject(keyValues)):
+                JSONSerializer.writeObject(keyValues, linePrefix: linePrefix, lineSuffix: lineSuffix, toValueStream: &literalStream)
+            case let .Right(literal):
+                output.write(literal)
+            }
+        }
+    }
+}
+
 //MARK: - JSONDeserializer
 private struct JSONDeserializer {
     
@@ -244,15 +343,6 @@ private struct JSONDeserializer {
             index = index.successor()
         }
         return UnicodeParser(view: view, index: index)
-    }
-    
-    struct StructureScalar {
-        static let BeginArray     = UnicodeScalar(0x5B) // [ left square bracket
-        static let EndArray       = UnicodeScalar(0x5D) // ] right square bracket
-        static let BeginObject    = UnicodeScalar(0x7B) // { left curly bracket
-        static let EndObject      = UnicodeScalar(0x7D) // } right curly bracket
-        static let NameSeparator  = UnicodeScalar(0x3A) // : colon
-        static let ValueSeparator = UnicodeScalar(0x2C) // , comma
     }
     
     static func consumeStructure(scalar: UnicodeScalar, input: UnicodeParser) throws -> UnicodeParser? {
@@ -313,7 +403,7 @@ private struct JSONDeserializer {
         static let QuotationMark = UnicodeScalar(0x22) // "
         static let Escape        = UnicodeScalar(0x5C) // \
     }
-    
+
     static func parseString(input: UnicodeParser) throws -> (String, UnicodeParser)? {
         guard let begin = try consumeScalar(StringScalar.QuotationMark, input: input) else {
             return nil
@@ -431,39 +521,51 @@ private struct JSONDeserializer {
         return (result, UnicodeParser(view: view, index: index))
     }
 
-    //MARK: - Value parsing
-    static func parseValue(input: UnicodeParser) throws -> (Any, UnicodeParser)? {
-        if let (value, parser) = try parseString(input) {
-            return (value, parser)
+    //MARK: - Collection parsing
+    static func parseCollection(input: UnicodeParser) throws -> (NSJSONValue, UnicodeParser)? {
+        if let (object,parser)  = try JSONDeserializer.parseObject(input) {
+            return (.JSONObject(object), parser)
         }
-        else if let parser = try consumeSequence("true", input: input) {
-            return (true, parser)
+        else if let (array, parser) = try JSONDeserializer.parseArray(input) {
+            return (.JSONArray(array), parser)
+        }
+        return nil
+    }
+
+
+    //MARK: - Value parsing
+    static func parseValue(input: UnicodeParser) throws -> (NSJSONValue, UnicodeParser)? {
+        if let parser = try consumeSequence("true", input: input) {
+            return (.JSONBool(true), parser)
         }
         else if let parser = try consumeSequence("false", input: input) {
-            return (false, parser)
+            return (.JSONBool(false), parser)
         }
         else if let parser = try consumeSequence("null", input: input) {
-            return (NSNull(), parser)
+            return (.JSONNull, parser)
         }
-        else if let (object, parser) = try parseObject(input) {
-            return (object, parser)
-        }
-        else if let (array, parser) = try parseArray(input) {
-            return (array, parser)
+        else if let (value, parser) = try parseString(input) {
+            return (.JSONString(value), parser)
         }
         else if let (number, parser) = try parseNumber(input) {
-            return (number, parser)
+            return (.JSONNumber(number), parser)
+        }
+        else if let (object, parser) = try parseObject(input) {
+            return (.JSONObject(object), parser)
+        }
+        else if let (array, parser) = try parseArray(input) {
+            return (.JSONArray(array), parser)
         }
         return nil
     }
 
     //MARK: - Object parsing
-    static func parseObject(input: UnicodeParser) throws -> ([String: Any], UnicodeParser)? {
+    static func parseObject(input: UnicodeParser) throws -> ([String: NSJSONValue], UnicodeParser)? {
         guard let beginParser = try consumeStructure(StructureScalar.BeginObject, input: input) else {
             return nil
         }
         var parser = beginParser
-        var output: [String: Any] = [:]
+        var output: [String: NSJSONValue] = [:]
         while true {
             if let finalParser = try consumeStructure(StructureScalar.EndObject, input: parser) {
                 return (output, finalParser)
@@ -487,7 +589,7 @@ private struct JSONDeserializer {
         }
     }
     
-    static func parseObjectMember(input: UnicodeParser) throws -> (String, Any, UnicodeParser)? {
+    static func parseObjectMember(input: UnicodeParser) throws -> (String, NSJSONValue, UnicodeParser)? {
         guard let (name, parser) = try parseString(input) else {
             throw NSError(domain: NSCocoaErrorDomain, code: NSCocoaError.PropertyListReadCorruptError.rawValue, userInfo: [
                 "NSDebugDescription" : "Missing object key at location \(input.distanceFromStart)"
@@ -508,12 +610,12 @@ private struct JSONDeserializer {
     }
 
     //MARK: - Array parsing
-    static func parseArray(input: UnicodeParser) throws -> ([Any], UnicodeParser)? {
+    static func parseArray(input: UnicodeParser) throws -> ([NSJSONValue], UnicodeParser)? {
         guard let beginParser = try consumeStructure(StructureScalar.BeginArray, input: input) else {
             return nil
         }
         var parser = beginParser
-        var output: [Any] = []
+        var output: [NSJSONValue] = []
         while true {
             if let finalParser = try consumeStructure(StructureScalar.EndArray, input: parser) {
                 return (output, finalParser)
